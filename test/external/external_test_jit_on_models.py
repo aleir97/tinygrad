@@ -6,7 +6,7 @@ from tinygrad.jit import TinyJit
 from tinygrad.helpers import dtypes, CI
 from test.helpers import derandomize_model
 
-from examples.llama import Transformer
+from examples.LLMs.llama import Transformer
 
 def helper_test_jitted_correctness(gen, train, train_jit):
   nojit = train(*gen()).numpy()

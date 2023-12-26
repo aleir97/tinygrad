@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 import pyaudio
 import yaml
-from llama import LLaMa
+from examples.LLMs.llama import LLaMa
 from vits import MODELS as VITS_MODELS
 from vits import Y_LENGTH_ESTIMATE_SCALARS, HParams, Synthesizer, TextMapper, get_hparams_from_file, load_model
 from whisper import init_whisper, transcribe_waveform

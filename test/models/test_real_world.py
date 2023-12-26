@@ -11,7 +11,7 @@ from test.helpers import derandomize_model
 
 from examples.gpt2 import Transformer as GPT2Transformer, MODEL_PARAMS as GPT2_MODEL_PARAMS
 from examples.hlb_cifar10 import SpeedyResNet
-from examples.llama import Transformer as LLaMaTransformer, MODEL_PARAMS as LLAMA_MODEL_PARAMS
+from examples.LLMs.llama import Transformer as LLaMaTransformer, MODEL_PARAMS as LLAMA_MODEL_PARAMS
 from examples.stable_diffusion import UNetModel, ResBlock
 
 global_mem_used = 0
