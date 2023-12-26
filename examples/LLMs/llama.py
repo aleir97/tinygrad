@@ -14,8 +14,8 @@ from tinygrad.nn.state import safe_load, torch_load, load_state_dict, get_parame
 from tinygrad.helpers import GlobalCounters
 from extra.models.llama import Transformer, convert_from_huggingface
 from sentencepiece import SentencePieceProcessor
-from linear_quants import AbsmaxQuantizedLinear, QK4_0Linear, tinyGGUF
-from personalities import get_llm_personality
+from examples.LLMs.linear_quants import AbsmaxQuantizedLinear, QK4_0Linear, tinyGGUF
+from examples.LLMs.personalities import get_llm_personality
 
 MAX_CONTEXT = getenv("MAX_CONTEXT", 4096)
 
