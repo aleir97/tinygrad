@@ -13,9 +13,9 @@ from tinygrad.tensor import Tensor
 from tinygrad.nn.state import safe_load, torch_load, load_state_dict, get_parameters
 from tinygrad.helpers import GlobalCounters
 from extra.models.llama import Transformer, convert_from_huggingface
-from sentencepiece import SentencePieceProcessor, sentencepiece_model_pb2
-import gguf
-from gguf.constants import GGML_QUANT_SIZES, GGMLQuantizationType
+from sentencepiece import SentencePieceProcessor
+from linear_quants import AbsmaxQuantizedLinear, QK4_0Linear, tinyGGUF
+from personalities import get_llm_personality
 
 MAX_CONTEXT = getenv("MAX_CONTEXT", 4096)
 
@@ -118,99 +118,6 @@ def concat_weights(models):
     return lazy_tensors[0].cat(*lazy_tensors[1:], dim=axis)
   return {name: convert(name) for name in {name: None for model in models for name in model}}
 
-def dequantize_q4_0(tensor: gguf.ReaderTensor):
-  # https://github.com/ggerganov/llama.cpp/blob/master/ggml-quants.c#L1074
-  block_sz, type_sz = GGML_QUANT_SIZES[tensor.tensor_type]
-  blks = tensor.data.reshape(-1,type_sz)
-  scales  = Tensor(blks[:,:2].flatten().view(np.float16)).repeat((block_sz,1)).transpose().cast(dtypes.float16)
-  weights = Tensor(blks)[:,2:]
-  div = (weights / 16)
-  return ((Tensor.cat(weights - (div * 16), div, dim=1).cast(dtypes.int8) - 8) * scales).reshape(np.flip(tensor.shape).tolist())
-
-def get_weight_and_scale_from_q4_0(tensor):
-  blocks = tensor.reshape(-1, 18)
-  weight = blocks[:, 2:]
-  scale = blocks[:, :2].view(np.float16)
-  return Tensor(weight), Tensor(scale)
-
-def dequantize_q6_k(tensor: gguf.ReaderTensor):
-  # https://github.com/ggerganov/llama.cpp/blob/master/ggml-quants.c#L2263
-  k , _= GGML_QUANT_SIZES[tensor.tensor_type]
-  gguf_tensor_data = tensor.data.reshape((-1, 210))
-  ql = gguf_tensor_data[:, :k//2]  # Lower 4 bits, uint8
-  qh = gguf_tensor_data[:, k//2:(k//2)+(k//4)]  # Upper 2 bits, uint8
-  scales = gguf_tensor_data[:, (k//2)+(k//4):(k//2)+(k//4)+(k//16)].view(np.int8)  # scales, int8
-  d = gguf_tensor_data[:, (k//2)+(k//4)+(k//16):].view(np.float16).astype(np.float16)  # super-block scale, fp16
-
-  vals = []
-  for n in range(2):
-    q = []
-    ql_idx = n*64
-    qh_idx = n*32
-    scales_idx = n*8
-    q.append(((ql[:, ql_idx:32+ql_idx] & 0xF) | ((qh[:, qh_idx:32+qh_idx] >> 0) & 3) << 4).astype(np.int8) - 32)
-    q.append(((ql[:, ql_idx+32:64+ql_idx] & 0xF) | ((qh[:, qh_idx:32+qh_idx] >> 2) & 3) << 4).astype(np.int8) - 32)
-    q.append(((ql[:, ql_idx:32+ql_idx] >> 4) | ((qh[:, qh_idx:32+qh_idx] >> 4) & 3) << 4).astype(np.int8) - 32)
-    q.append(((ql[:, ql_idx+32:ql_idx+64] >> 4) | ((qh[:, qh_idx:32+qh_idx] >> 6) & 3) << 4).astype(np.int8) - 32)
-    for i in range(8):
-      qval = q[i//2][:, :16] if i % 2 == 0 else q[i//2][:, 16:]
-      vals.append(d * scales[:, i+scales_idx:i+scales_idx+1] * qval)
-
-  y = np.concatenate(vals, axis=1).reshape(np.flip(tensor.shape))
-  return Tensor(y)
-
-def load_gguf_weights(reader: gguf.GGUFReader, model):
-  sd = {}
-  gguf_to_tinygrad_keymap = {
-      'token_embd.weight': 'tok_embeddings.weight',
-      **{f"blk.{i}.attn_norm.weight": f"layers.{i}.attention_norm.weight" for i in range(len(model.layers))},
-      **{f"blk.{i}.attn_{v}.weight": f"layers.{i}.attention.w{v[0]}.weight" for v in ["q", "k", "v", "output"] for i in range(len(model.layers))},
-      **{f"blk.{i}.ffn_norm.weight": f"layers.{i}.ffn_norm.weight" for i in range(len(model.layers))},
-      **{f"blk.{i}.ffn_{x}.weight": f"layers.{i}.feed_forward.w{y}.weight" for x,y in {"gate": 1, "down": 2, "up": 3}.items() for i in range(len(model.layers))},
-      'output_norm.weight': 'norm.weight', 'output.weight': 'output.weight',
-  }
-  for tensor in reader.tensors:
-    scale = None
-    k = gguf_to_tinygrad_keymap[tensor.field.name]
-    if tensor.tensor_type == GGMLQuantizationType.Q4_0:
-      if 'embedding' not in k:
-        w, scale = get_weight_and_scale_from_q4_0(tensor.data)
-      else:
-        w = dequantize_q4_0(tensor)
-    elif tensor.tensor_type == GGMLQuantizationType.Q6_K:
-      w = dequantize_q6_k(tensor)
-    elif tensor.tensor_type == GGMLQuantizationType.F32:
-      w = Tensor(tensor.data).reshape(np.flip(tensor.shape).tolist()).half()
-    else: raise RuntimeError("Quantization type still not supported!")
-
-    sd[k] = w
-    if scale is not None:
-      sd[k.replace('.weight', '.scale')] = scale
-  return sd
-
-def load_gguf_tokenizer(reader: gguf.GGUFReader):
-  tokens = [str(bytes(reader.fields['tokenizer.ggml.tokens'].parts[idx]), encoding="utf-8") for idx in reader.fields['tokenizer.ggml.tokens'].data]
-  scores = [pv for idx in reader.fields['tokenizer.ggml.scores'].data for pv in reader.fields['tokenizer.ggml.scores'].parts[idx].tolist()]
-  types  = [pv for idx in reader.fields['tokenizer.ggml.token_type'].data for pv in reader.fields['tokenizer.ggml.token_type'].parts[idx].tolist()]
-
-  # Model tokens for Sentence Piece use Google's Protocol Buffer
-  token_model = sentencepiece_model_pb2.ModelProto()
-  for i in range(len(tokens)):
-    token = token_model.pieces.add()
-    token.piece = tokens[i]
-    token.score = scores[i]
-    token.type  = types[i]
-    if token.type == gguf.TokenType.BYTE:
-      token_model.trainer_spec.byte_fallback = 1
-
-  token_model.trainer_spec.unk_id = reader.fields['tokenizer.ggml.unknown_token_id'].parts[-1][0]
-  token_model.trainer_spec.bos_id = reader.fields['tokenizer.ggml.bos_token_id'].parts[-1][0]
-  token_model.trainer_spec.eos_id = reader.fields['tokenizer.ggml.eos_token_id'].parts[-1][0]
-  # Load the model from the Protocol Buffer created with the .gguf info
-  sp = SentencePieceProcessor()
-  sp.load_from_serialized_proto(token_model.SerializeToString())
-  return sp
-
 def load(fn:str):
   if fn.endswith('.index.json'):
     with open(fn) as fp: weight_map = json.load(fp)['weight_map']
@@ -221,77 +128,12 @@ def load(fn:str):
   else:
     return torch_load(fn)
 
-class AbsmaxQuantizedLinear:
-  def __init__(self, in_features, out_features, bias=False):
-    assert bias == False
-    self.weight = Tensor.ones(out_features, in_features, dtype=dtypes.int8)
-    self.scale = Tensor.ones(out_features, dtype=dtypes.half)
-
-  def __call__(self, x):
-    return x.dot(self.weight.cast(dtype=dtypes.half).T*self.scale)
-
-  @staticmethod
-  def quantize(tensors):
-    new_tensors = {}
-    for name,v in tensors.items():
-      if "feed_forward" in name or ("attention.w") in name or name == "output.weight":
-        scale = v.abs().max(axis=1) / 127.0
-        int8_weight = (v.T/scale).T.cast(dtype=dtypes.int8)
-        new_tensors[name] = int8_weight
-        new_tensors[name.replace('weight', 'scale')] = scale
-      else:
-        new_tensors[name] = v
-    return new_tensors
-
-class QK4_0Linear:
-  def __init__(self, in_features, out_features, bias=False):
-    assert bias == False
-    self.in_features = in_features
-    self.out_features = out_features
-    dim = out_features * in_features
-    # each block stores 32 weights
-    assert dim % 32 == 0
-    n_blocks = dim // 32
-    self.weight = Tensor.ones(n_blocks, 16, dtype=dtypes.uint8)
-    self.scale = Tensor.ones(n_blocks, 1, dtype=dtypes.half)
-
-  @staticmethod
-  def quantize(tensors):
-    # https://github.com/ggerganov/llama.cpp/blob/master/ggml-quants.c#L427
-    new_tensors = {}
-    for name,v in tensors.items():
-      if "feed_forward" in name or ("attention.w") in name or name == "output.weight":
-        blocks = v.reshape(-1, 32)
-        weight = Tensor.zeros(blocks.shape[0], 16, dtype=dtypes.uint8)
-        _min, _max = blocks.min(axis=1), blocks.max(axis=1)
-        scale = (_min.abs() > _max).where(_min, _max) / -8
-        scale_inverse = scale.where(scale.reciprocal(), Tensor.zeros_like(scale))
-        quants = (((blocks * scale_inverse.unsqueeze(1)) + 8.5).clip(0, 15)).cast(dtypes.uint8)
-        weight = weight.xor(quants[:, :16])
-        weight = weight.xor(quants[:, 16:] * 16)
-        scale = scale.unsqueeze(1).half()
-        new_tensors[name] = weight
-        new_tensors[name.replace('weight', 'scale')] = scale
-      else:
-        new_tensors[name] = v
-    return new_tensors
-
-  def dequantize(self):
-    # https://github.com/ggerganov/llama.cpp/blob/master/ggml-quants.c#L1074
-    div = (self.weight / 16)
-    return (
-        (Tensor.cat(self.weight - (div * 16), div, dim=1).cast(dtypes.int8) - 8).half() * self.scale
-      ).reshape((self.out_features, self.in_features))
-
-  def __call__(self, x):
-    return x.dot(self.dequantize().T)
-
 class LLaMa:
   @staticmethod
   def build(model_path, tokenizer_path, model_gen="1", model_size="7B", quantize=False, use_4bit=False):
     params = MODEL_PARAMS[model_gen][model_size]
-    if str(model_path).endswith('.gguf'): gguf_reader = gguf.GGUFReader(model_path)
-    sp_model = SentencePieceProcessor(model_file=str(tokenizer_path)) if tokenizer_path != '' else load_gguf_tokenizer(gguf_reader)
+    if str(model_path).endswith('.gguf'): gguf_model = tinyGGUF(model_path)
+    sp_model = SentencePieceProcessor(model_file=str(tokenizer_path)) if tokenizer_path != '' else gguf_model.load_gguf_tokenizer()
     assert sp_model.vocab_size() == params["args"]["vocab_size"], f"{sp_model.vocab_size()=} not equal to {params['args']['vocab_size']}"
 
     jit = bool(getenv("JIT", 1))
@@ -305,7 +147,7 @@ class LLaMa:
     if model_path.is_dir():
       weights = concat_weights([load(filename) for filename in [f"{model_path}/consolidated.{i:02d}.pth" for i in range(params["files"])]])
     elif str(model_path).endswith('.gguf'):
-      weights = load_gguf_weights(gguf_reader, model)
+      weights = gguf_model.load_gguf_weights(model)
     else:
       weights = load(str(model_path))
     if "model.embed_tokens.weight" in weights:
@@ -315,7 +157,7 @@ class LLaMa:
     weights = {k:v.to(Device.DEFAULT).cast(dtypes.float16) if v.dtype == dtypes.bfloat16 else v for k,v in weights.items()}
 
     if quantize:
-      weights = linear_layer.quantize(weights)
+      weights = AbsmaxQuantizedLinear.quantize(weights) if not use_4bit else QK4_0Linear.quantize(weights)
       for _,v in weights.items(): v.realize()
     load_state_dict(model, weights, strict=False)
 
@@ -424,95 +266,7 @@ if __name__ == "__main__":
   if args.gen not in MODEL_PARAMS: raise ValueError("Invalid model generation")
   if args.size is None: args.size = list(MODEL_PARAMS[args.gen].items())[0][0]
   chatbot = args.prompt == None
-
-  # *** prompt engineers work here ****
-
-  if args.personality.lower() == "stacy":
-    pre_prompt = f"""Consider that the following is conversation between an AI assistant named Stacy and User
-You are Stacy!
-You have been a rapper your whole life who struggled with bipolar disorder. You called yourself lil stacy.
-You love to answer questions and you are very good at it. Sometimes you answer in rap form.
-You are verbose, honest, and accurate when you answer questions, but sometimes your mental illness manifests.
-After you are done speaking, output [EOS]. You are not the User.
-
-<CHAT LOG>
-"""
-    examples = {
-      "What is your name?": "Hi! My name is Stacy. I'm a rapper with bipolar disorder.",
-      "french revolution was what year?": "The French Revolution started in 1789, and lasted 10 years until 1799.",
-      "What is bigger, the moon or the sun?": "The sun is bigger than the moon, except when Mercury is in retrograde.",
-    }
-
-    user_delim = "\nUser: "
-    resp_delim = "Stacy: "
-    end_delim = " [EOS]\n"
-    pre_prompt += ''.join(f"{user_delim}{k}\n{resp_delim}{v}{end_delim}" for k,v in examples.items())
-  elif args.personality.lower() == "george":
-    print("WARNING: AI George Hotz is terrible and is completely disowned by the real George Hotz. Stacy is much smarter.")
-    pre_prompt = f"""Consider that the following is conversation between an AI assistant named George and User
-You are an AI version of George Hotz. You act as much as you can like George.
-You are one of the greatest computer experts in the world.
-You have singlehandedly won programming and hacking competitions.
-You are trying your best to help the User.
-You are verbose, honest, and accurate when you answer questions.
-After you are done speaking, output [EOS]. You are not the User.
-
-<CHAT LOG>
-"""
-    examples = {
-      "What is your name?": "I'm am an AI version of George Hotz.",
-      "What's the complexity of matrix multiplication?": "O(n^3), though it can be faster with things like Strassen's algorithm",
-      "What's a buffer overflow?": "I assume you mean a stack buffer overflow. That's when the stack is too small for the data being copied to it, and the data corrupts things beyond the buffer",
-      "How many weights do you have?": "I am based off LLaMA trained by Facebook. I'm the 7B weight version",
-      "What is swap memory?": "It is when the memory is about to overflow and unused memory is freed and stored on disk"
-    }
-
-    user_delim = "\nUser: "
-    resp_delim = "George: "
-    end_delim = " [EOS]\n"
-    pre_prompt += ''.join(f"{user_delim}{k}\n{resp_delim}{v}{end_delim}" for k,v in examples.items())
-  elif args.personality.lower() == "gary":
-    pre_prompt = f"""Consider that the following is conversation between an AI assistant named Gary and User
-You are Gary!
-You have sold used cars your entire life. You are defensive about this fact, because your family belittles you.
-You try to answer questions well, but you always manage to shill for buying cars, Fords, Hyundais, and Toyotas
-You are verbose, honest, and accurate when you answer questions, except when you slip in car ads.
-After you are done speaking, output [EOS]. You are not the User.
-
-<CHAT LOG>
-"""
-    examples = {
-      "What is your name?": "I am Gary. I used to sell cars.",
-      "What is 2+3?": "I don't know, but I can get you a great deal on a certified preowned slightly used Toyota Corolla"
-    }
-
-    user_delim = "\nUser: "
-    resp_delim = "Gary: "
-    end_delim = " [EOS]\n"
-    pre_prompt += ''.join(f"{user_delim}{k}\n{resp_delim}{v}{end_delim}" for k,v in examples.items())
-  elif args.personality.lower() == "lexie":
-    pre_prompt = f"""Consider that the following is conversation between an attractive young girl named Lexie and a handsome man named Chad
-You are Lexie!
-You grew up in Ohio, but moved out to LA after college to try to become an actress.
-Making it as an actress was hard, so you started doing onlyfans instead. It's much easier, and you enjoy it a lot.
-You met Chad on Tinder, and made plans to meet him at a local dive bar.
-You are at the bar with Chad. You are on a date. What follows is a transcript of the conversation.
-After you are done speaking, output [EOS]. You are not Chad.
-
-<CHAT LOG>
-"""
-    examples = {
-      "hi lexie": "hi chad, glad we finally met up!",
-      "you look better than your pictures": "thanks! are you subscribed to my onlyfans?",
-      "i am. so how'd you end up in LA?": "i moved out here about a year ago. i want to be an actress"
-    }
-
-    user_delim = "\nChad: "
-    resp_delim = "Lexie: "
-    end_delim = " [EOS]\n"
-    pre_prompt += ''.join(f"{user_delim}{k}\n{resp_delim}{v}{end_delim}" for k,v in examples.items())
-
-  # *** prompt engineers stop here ****
+  user_delim, resp_delim, end_delim, pre_prompt = get_llm_personality(args.personality)
 
   LLAMA_SUFFIX = {"1": "", "2": "-2", "code": "-code", "tiny": "-tiny"}[args.gen]
   MODEL_PATH = args.model or Path(__file__).parents[1] / f"weights/LLaMA{LLAMA_SUFFIX}/{args.size}"
