@@ -3,11 +3,10 @@ import os, subprocess, pathlib, ctypes, tempfile, functools
 import Metal, libdispatch
 from typing import List, Any, Tuple, Optional
 from tinygrad.codegen.kernel import LinearizerOptions
-from tinygrad.helpers import prod, getenv, DEBUG, diskcache, unwrap2
+from tinygrad.helpers import prod, getenv, DEBUG, unwrap2
 from tinygrad.device import Compiled, LRUAllocator
 from tinygrad.renderer.cstyle import MetalRenderer
 
-@diskcache
 def compile_metal(prg, use_xcode=bool(getenv("METAL_XCODE"))) -> bytes:
   assert MetalDevice.compiler_device, "metal device creation is required for metal compile"
   if use_xcode:
@@ -81,7 +80,7 @@ class MetalDevice(Compiled):
     self.mtl_buffers_in_flight: List[Any] = []
     self.mv_in_metal: List[memoryview] = []
     from tinygrad.runtime.graph.metal import MetalGraph
-    super().__init__(MetalAllocator(self), LinearizerOptions(device="METAL"), MetalRenderer,
+    super().__init__(MetalAllocator(self), LinearizerOptions("METAL"), MetalRenderer,
                      compile_metal, functools.partial(MetalProgram, self), functools.partial(MetalGraph, self))
   def synchronize(self):
     for cbuf in self.mtl_buffers_in_flight: cbuf.waitUntilCompleted()

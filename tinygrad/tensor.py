@@ -1,15 +1,15 @@
 # inspired by https://github.com/karpathy/micrograd/blob/master/micrograd/engine.py
 from __future__ import annotations
-import time, math
-from typing import List, Tuple, Callable, Optional, ClassVar, Type, Union, Sequence, Iterable, DefaultDict, cast
+import time, math, itertools
+from typing import List, Tuple, Callable, Optional, ClassVar, Type, Union, Sequence, Iterable, DefaultDict, cast, get_args
 from collections import defaultdict
 from functools import partialmethod, reduce
-from itertools import accumulate
 import numpy as np
 
-from tinygrad.helpers import DType, dtypes, ImageDType, least_upper_float, least_upper_dtype
+from tinygrad.dtype import DType, dtypes, ImageDType, least_upper_float, least_upper_dtype
 from tinygrad.helpers import argfix, make_pair, getenv, IMAGE, DEBUG, flatten, prod, all_int, round_up, merge_dicts, fully_flatten
 from tinygrad.lazy import LazyBuffer, create_schedule
+from tinygrad.features.multi import MultiLazyBuffer
 from tinygrad.ops import LoadOps
 from tinygrad.device import Device, Buffer
 from tinygrad.shape.symbolic import sint
@@ -18,7 +18,7 @@ from tinygrad.realize import run_schedule
 # **** start with two base classes, Tensor and Function ****
 
 class Function:
-  def __init__(self, device:str, *tensors:Tensor):
+  def __init__(self, device:Union[str, Tuple[str, ...]], *tensors:Tensor):
     self.device = device
     self.needs_input_grad = [t.requires_grad for t in tensors]
     self.requires_grad = True if any(self.needs_input_grad) else None if None in self.needs_input_grad else False
@@ -30,11 +30,18 @@ class Function:
   @classmethod
   def apply(fxn:Type[Function], *x:Tensor, **kwargs) -> Tensor:
     ctx = fxn(x[0].device, *x)
-    ret = Tensor(ctx.forward(*[t.lazydata for t in x], **kwargs), device=ctx.device, requires_grad=ctx.requires_grad)
-    if ctx.requires_grad and not Tensor.no_grad: ret._ctx = ctx    # used by autograd engine
+    ret = Tensor.__new__(Tensor)
+    ret.lazydata, ret.requires_grad, ret.grad = ctx.forward(*[t.lazydata for t in x], **kwargs), ctx.requires_grad, None
+    ret._ctx = ctx if ctx.requires_grad and not Tensor.no_grad else None  # used by autograd engine
     return ret
 
 import tinygrad.mlops as mlops
+
+def _loadop(op, shape:Tuple[sint,...], dtype:DType, device:Union[str, Tuple[str, ...]], arg=None, src:Optional[LazyBuffer]=None):
+  if isinstance(device, str): return LazyBuffer.loadop(op, shape, dtype, device, arg, src)
+  return MultiLazyBuffer([LazyBuffer.loadop(op, shape, dtype, d, arg, src) for d in device], None)
+
+Scalar = Union[float, int, bool]
 
 class Tensor:
   __slots__ = "lazydata", "requires_grad", "grad", "_ctx"
@@ -46,10 +53,10 @@ class Tensor:
     def __exit__(self, exc_type, exc_value, traceback): Tensor.training = self.prev
 
   no_grad: ClassVar[bool] = False
-  def __init__(self, data:Union[None, bool, int, float, List, Tuple, LazyBuffer, np.ndarray, bytes],
-               device:Optional[str]=None, dtype:Optional[DType]=None, requires_grad:Optional[bool]=None):
+  def __init__(self, data:Union[None, Scalar, List, Tuple, LazyBuffer, np.ndarray, bytes, MultiLazyBuffer],
+               device:Optional[Union[str, tuple, list]]=None, dtype:Optional[DType]=None, requires_grad:Optional[bool]=None):
     assert dtype is None or isinstance(dtype, DType), f"invalid dtype {dtype}"
-    device = Device.canonicalize(device)
+    device = tuple(Device.canonicalize(x) for x in device) if isinstance(device, (tuple, list)) else Device.canonicalize(device)
     # tensors have gradients, buffers do not
     self.grad: Optional[Tensor] = None
 
@@ -60,9 +67,9 @@ class Tensor:
     # internal variables used for autograd graph construction
     self._ctx: Optional[Function] = None
     if isinstance(data, LazyBuffer): assert dtype is None or dtype == data.dtype, "dtype doesn't match, and casting isn't supported"
-    elif isinstance(data, (bool, int, float)): data = LazyBuffer.loadop(LoadOps.CONST, tuple(), dtype or dtypes.from_py(data), device, data)
+    elif isinstance(data, get_args(Scalar)): data = _loadop(LoadOps.CONST, tuple(), dtype or dtypes.from_py(data), device, data)
     elif isinstance(data, bytes): data = LazyBuffer.fromCPU(np.frombuffer(data, np.uint8))
-    elif data is None: data = LazyBuffer.loadop(LoadOps.EMPTY, (0,), dtype or dtypes.default_float, device)
+    elif data is None: data = _loadop(LoadOps.EMPTY, (0,), dtype or dtypes.default_float, device)
     elif isinstance(data, list):
       if (d := fully_flatten(data)) and all(isinstance(s, bool) for s in d): dtype = dtype or dtypes.bool
       elif d and all_int(d): dtype = dtype or dtypes.default_int
@@ -70,12 +77,16 @@ class Tensor:
       # NOTE: cast at the end for the dtypes that do not have a numpy dtype
       data = LazyBuffer.fromCPU(np.array(data, dtype.np)).cast(dtype)
     elif isinstance(data, np.ndarray):
-      if data.shape == (): data = LazyBuffer.loadop(LoadOps.CONST, tuple(), dtype or dtypes.from_np(data.dtype), device, data.item())
+      if data.shape == (): data = _loadop(LoadOps.CONST, tuple(), dtype or dtypes.from_np(data.dtype), device, data.item())
       else: data = LazyBuffer.fromCPU(data.astype(dtype.np) if dtype is not None and dtype.np is not None else data)
 
     # data is a LazyBuffer, but it might be on the wrong device
-    if not isinstance(data, LazyBuffer): raise RuntimeError(f"can't create Tensor from {data!r} with type {type(data)}")
-    self.lazydata = data if data.device == device else data.copy_to_device(device)
+    if not isinstance(data, (LazyBuffer, MultiLazyBuffer)): raise RuntimeError(f"can't create Tensor from {data!r} with type {type(data)}")
+    if isinstance(device, tuple):
+      # TODO: what if it's a MultiLazyBuffer on other devices?
+      self.lazydata: Union[LazyBuffer, MultiLazyBuffer] = MultiLazyBuffer.from_sharded(data, device, None) if isinstance(data, LazyBuffer) else data
+    else:
+      self.lazydata = data if data.device == device else data.copy_to_device(device)
 
   def __repr__(self):
     return f"<Tensor {self.lazydata!r} on {self.device} with grad {(self.grad.lazydata if self.grad else None)!r}>"
@@ -84,7 +95,7 @@ class Tensor:
   def __hash__(self): return id(self)
 
   @property
-  def device(self) -> str: return self.lazydata.device
+  def device(self) -> Union[str, Tuple[str, ...]]: return self.lazydata.device
 
   @property
   def shape(self) -> Tuple[sint, ...]: return self.lazydata.shape
@@ -95,7 +106,8 @@ class Tensor:
   # ***** data handlers ****
 
   @staticmethod
-  def corealize(lst:Iterable[Tensor]): run_schedule(create_schedule([x.lazydata for x in lst]))
+  def corealize(lst:Iterable[Tensor]):
+    return run_schedule(create_schedule(flatten([x.lazydata.lbs if isinstance(x.lazydata, MultiLazyBuffer) else [x.lazydata] for x in lst])))
 
   def realize(self) -> Tensor:
     run_schedule(self.lazydata.schedule())
@@ -103,7 +115,7 @@ class Tensor:
 
   def assign(self, x) -> Tensor:
     # TODO: this is a hack for writing to DISK. remove with working assign
-    if self.device.startswith("DISK"):
+    if isinstance(self.device, str) and self.device.startswith("DISK"):
       if x.__class__ is not Tensor: x = Tensor(x, device="CPU", dtype=self.dtype)
       self.contiguous().realize().lazydata.base.realized.copyin(x.numpy().data)
       return self
@@ -112,13 +124,17 @@ class Tensor:
     assert self.shape == x.shape, f"assign shape mismatch {self.shape} != {x.shape}"
     assert not x.requires_grad  # self requires_grad is okay?
     if DEBUG >= 4: print(f"assign {self.lazydata} <- {x.lazydata}")
-    if self.dtype == x.dtype and self.lazydata.base.realized is not None and not getenv("DISALLOW_ASSIGN"): x.lazydata.output_buffer = self.lazydata.base.realized  # noqa: E501
+    if self.dtype == x.dtype and not getenv("DISALLOW_ASSIGN"):
+      if isinstance(self.lazydata, MultiLazyBuffer):
+        for d,s in zip(x.lazydata.lbs, self.lazydata.lbs): d.output_buffer = s.base.realized
+      else:
+        if self.lazydata.base.realized is not None: x.lazydata.output_buffer = self.lazydata.base.realized
     self.lazydata = x.lazydata
     return self
   def detach(self) -> Tensor: return Tensor(self.lazydata, device=self.device, requires_grad=False)
 
   # TODO: these are good places to start removing numpy
-  def item(self) -> Union[float, int, bool]:
+  def item(self) -> Scalar:
     assert self.numel() == 1, "must have one element for item"
     return cast(Buffer, self.contiguous().realize().lazydata.base.realized).toCPU().item()
   def data(self) -> memoryview: return self.numpy().data
@@ -128,7 +144,8 @@ class Tensor:
     assert all_int(self.shape), f"no numpy if shape is symbolic, {self.shape=}"
     assert self.dtype.np is not None, f"no numpy dtype for {self.dtype}"
     if 0 in self.shape: return np.zeros(self.shape, dtype=self.dtype.np)
-    return self.cast(self.dtype.scalar()).contiguous().realize().lazydata.base.realized.toCPU().astype(self.dtype.np, copy=True).reshape(self.shape)
+    t = self if isinstance(self.device, str) else self.to("CPU")
+    return t.cast(self.dtype.scalar()).contiguous().realize().lazydata.base.realized.toCPU().astype(self.dtype.np, copy=True).reshape(self.shape)
 
   def to(self, device:Optional[str]) -> Tensor:
     if device is None or device == self.device: return self
@@ -141,6 +158,15 @@ class Tensor:
     if self.grad: self.grad = self.grad.to_(device)
     _ret = Tensor(self.lazydata, device)
     self.lazydata = _ret.lazydata
+
+  def shard(self, devices:Tuple[str, ...], axis:Optional[int]=None) -> Tensor:
+    assert isinstance(self.lazydata, LazyBuffer), "can't shard a MultiLazyBuffer"
+    canonical_devices = tuple(Device.canonicalize(x) for x in devices)
+    return Tensor(MultiLazyBuffer.from_sharded(self.lazydata, canonical_devices, axis), device=canonical_devices)
+
+  def shard_(self, devices:Tuple[str, ...], axis:Optional[int]=None):
+    self.lazydata = self.shard(devices, axis).lazydata
+    return self
 
   # ***** creation llop entrypoint *****
 
@@ -161,7 +187,7 @@ class Tensor:
   # ***** creation helper functions *****
 
   @staticmethod
-  def full(shape:Tuple[sint, ...], fill_value: Union[bool, int, float], **kwargs):
+  def full(shape:Tuple[sint, ...], fill_value:Scalar, **kwargs):
     return Tensor(fill_value, **kwargs).reshape((1, )*len(new_shape := argfix(shape))).expand(new_shape)
 
   @staticmethod
@@ -174,13 +200,13 @@ class Tensor:
   def arange(start, stop=None, step=1, **kwargs):
     if stop is None: stop, start = start, 0
     dtype = kwargs.pop("dtype", dtypes.default_float if any(isinstance(x, float) for x in (start, stop, step)) else dtypes.default_int)
-    return Tensor.full((math.ceil((stop-start)/step),), step, dtype=dtype, **kwargs).cumsum() + (start - step)
+    return (Tensor.full((math.ceil((stop-start)/step),), step, dtype=dtype, **kwargs).cumsum() + (start - step)).cast(dtype)
 
   @staticmethod
   def eye(dim:int, **kwargs):
-    return Tensor.ones((dim,1),**kwargs).pad((None,(0,dim))).reshape(dim*(dim+1)).shrink(((0,dim*dim),)).reshape(dim, dim)
+    return Tensor.ones((dim,1),**kwargs).pad((None,(0,dim))).flatten().shrink(((0,dim*dim),)).reshape(dim, dim)
 
-  def full_like(self, fill_value: Union[bool, int, float], **kwargs):
+  def full_like(self, fill_value:Scalar, **kwargs):
     return Tensor.full(self.shape, fill_value, dtype=kwargs.pop("dtype", self.dtype), device=kwargs.pop("device", self.device), **kwargs)
   def zeros_like(self, **kwargs): return self.full_like(0, **kwargs)
   def ones_like(self, **kwargs): return self.full_like(1, **kwargs)
@@ -190,11 +216,11 @@ class Tensor:
   @staticmethod
   def randn(*shape, dtype:Optional[DType]=None, **kwargs) -> Tensor:
     # https://en.wikipedia.org/wiki/Box%E2%80%93Muller_transform
-    src = Tensor.rand(2, *shape, **kwargs)
+    src = Tensor.rand((2, *argfix(*shape)), **kwargs)
     return src[0].mul(2*math.pi).cos().mul((1 - src[1]).log().mul(-2).sqrt()).cast(dtype or dtypes.default_float)
 
   @staticmethod
-  def randint(*shape, low=0, high=10, **kwargs) -> Tensor: return Tensor.uniform(shape, low=low, high=high, dtype=dtypes.int32)
+  def randint(*shape, low=0, high=10, **kwargs) -> Tensor: return Tensor.uniform(*shape, low=low, high=high, dtype=dtypes.int32)
 
   @staticmethod
   def normal(*shape, mean=0.0, std=1.0, **kwargs) -> Tensor: return (std * Tensor.randn(*shape, **kwargs)) + mean
@@ -205,32 +231,33 @@ class Tensor:
     return ((high-low) * Tensor.rand(*shape, **kwargs)).cast(dtype) + low
 
   @staticmethod
-  def scaled_uniform(*shape, **kwargs) -> Tensor: return Tensor.uniform(*shape, low=-1.0, high=1.0, **kwargs).mul(prod(shape)**-0.5)
+  def scaled_uniform(*shape, **kwargs) -> Tensor: return Tensor.uniform(*shape, low=-1.0, high=1.0, **kwargs).mul(prod(argfix(*shape))**-0.5)
 
   # https://www.tensorflow.org/api_docs/python/tf/keras/initializers/GlorotUniform
   @staticmethod
-  def glorot_uniform(*shape, **kwargs) -> Tensor: return Tensor.uniform(*shape, low=-1.0, high=1.0, **kwargs).mul((6/(shape[0]+prod(shape[1:])))**0.5)
+  def glorot_uniform(*shape, **kwargs) -> Tensor:
+    return Tensor.uniform(*shape, low=-1.0, high=1.0, **kwargs).mul((6/(argfix(*shape)[0]+prod(argfix(*shape)[1:])))**0.5)
 
   # https://pytorch.org/docs/stable/_modules/torch/nn/init.html#kaiming_uniform_
   @staticmethod
   def kaiming_uniform(*shape, a:float = 0.01, **kwargs) -> Tensor:
-    bound = math.sqrt(3.0) * math.sqrt(2.0 / (1 + a ** 2)) / math.sqrt(prod(shape[1:]))
+    bound = math.sqrt(3.0) * math.sqrt(2.0 / (1 + a ** 2)) / math.sqrt(prod(argfix(*shape)[1:]))
     return Tensor.uniform(*shape, low=-bound, high=bound, **kwargs)
 
   # https://pytorch.org/docs/stable/_modules/torch/nn/init.html#kaiming_normal_
   @staticmethod
   def kaiming_normal(*shape, a:float = 0.01, **kwargs) -> Tensor:
-    std = math.sqrt(2.0 / (1 + a ** 2)) / math.sqrt(prod(shape[1:]))
+    std = math.sqrt(2.0 / (1 + a ** 2)) / math.sqrt(prod(argfix(*shape)[1:]))
     return Tensor.normal(*shape, mean=0.0, std=std, **kwargs)
 
   def multinomial(self:Tensor, num_samples:int = 1, replacement:bool = False) -> Tensor:
     assert 1 <= self.ndim <= 2 and num_samples > 0, f"{self.ndim=} must be 1 or 2 dim, {num_samples=} must be positive"
     assert replacement or num_samples == 1, "no replacement only supports num_samples = 1"
     weight = self.unsqueeze(0) if self.ndim == 1 else self
-    cdf = (cw := weight.cumsum(1)) / cw[:, -1].unsqueeze(1)
+    cdf = (cw := weight.cumsum(1).float()) / cw[:, -1].unsqueeze(1)
     unif_samples = Tensor.rand(num_samples, cdf.shape[0], 1)
     indices = (unif_samples.expand((-1, -1, cdf.shape[1])) >= cdf).sum(2).permute((1, 0))
-    return (indices.squeeze(0) if self.ndim == 1 else indices).cast(dtypes.int32)
+    return (indices.squeeze(0) if self.ndim == 1 else indices).cast(dtypes.default_int)
 
   # ***** toposort and backward pass *****
 
@@ -267,14 +294,15 @@ class Tensor:
 
   def reshape(self, shape, *args) -> Tensor:
     new_shape = argfix(shape, *args)
-    return mlops.Reshape.apply(self, shape=tuple([-prod(self.shape) // prod(new_shape) if s == -1 else (s if s is not None else self.shape[i]) for i,s in enumerate(new_shape)]))  # noqa: E501
+    new_shape = tuple([-prod(self.shape) // prod(new_shape) if s == -1 else (s if s is not None else self.shape[i]) for i,s in enumerate(new_shape)])
+    return mlops.Reshape.apply(self, shape=new_shape) if new_shape != self.shape else self
   def expand(self, shape, *args) -> Tensor:
-    if shape == self.shape: return self
-    return mlops.Expand.apply(self, shape=tuple([x if x != -1 else s for s,x in zip(self.shape, argfix(shape, *args))]))
+    new_shape = tuple([x if x != -1 else s for s,x in zip(self.shape, argfix(shape, *args))])
+    return mlops.Expand.apply(self, shape=new_shape) if new_shape != self.shape else self
   def permute(self, order, *args) -> Tensor: return mlops.Permute.apply(self, order=argfix(order, *args))
   def flip(self, axis, *args) -> Tensor: return mlops.Flip.apply(self, axis=[x if x >= 0 else x+len(self.shape) for x in argfix(axis, *args)])
   def shrink(self, arg:Tuple[Optional[Tuple[sint, sint]], ...]) -> Tensor:
-    if not any(x is not None and x != (0,s) for x,s in zip(arg, self.shape)): return self
+    if all(x is None or x == (0,s) for x,s in zip(arg, self.shape)): return self
     return mlops.Shrink.apply(self, arg=tuple(x if x is not None else (0,s) for x,s in zip(arg, self.shape)))
   def pad(self, arg:Tuple[Optional[Tuple[sint, sint]], ...], value:float=0.0) -> Tensor:
     if all(x is None or x == (0,0) for x in arg): return self
@@ -367,7 +395,7 @@ class Tensor:
     for dim in (dims_collapsed := [dim + sum(1 for d in type_dim[None] if dim >= d) for dim in reversed(type_dim[int])]): new_shape.pop(dim)
     assert all_int(new_shape), f"does not support symbolic shape {new_shape}"
 
-    ret = ret.reshape(tuple(new_shape))
+    ret = ret.reshape(new_shape)
 
     # 3. advanced indexing (copy)
     if type_dim[Tensor]:
@@ -423,11 +451,10 @@ class Tensor:
     if dim < 0: dim += self.ndim
     assert all(len(y.shape) == len(self.shape) and all(y.shape[i] == s for i,s in enumerate(self.shape) if i != dim) for y in args)
     catargs = [self, *args]
-    assert all(t.shape for t in catargs), "zero-dimensional tensor cannot be concatenated"
-    shapes = [s.shape[dim] for s in catargs]
-    shape_cumsum = [0, *accumulate(shapes)]
+    cat_dims = [s.shape[dim] for s in catargs]
+    cat_dim_cumsum = [0, *itertools.accumulate(cat_dims)]
     slc:List[List[Optional[Tuple[sint, sint]]]] = [[None for _ in self.shape] for _ in catargs]
-    for shp,k,s in zip(shapes, shape_cumsum[:-1], slc): s[dim] = (k, shape_cumsum[-1] - k - shp)
+    for d,k,s in zip(cat_dims, cat_dim_cumsum[:-1], slc): s[dim] = (k, cat_dim_cumsum[-1] - k - d)
     return reduce(Tensor.__add__, [arg.pad(tuple(s)) for arg,s in zip(catargs, slc)])
 
   @staticmethod
@@ -443,6 +470,12 @@ class Tensor:
     final_shape = [r*s for r,s in zip(repeats, base_shape)]
     return self.reshape(new_shape).expand(expand_shape).reshape(final_shape)
 
+  def split(self, sizes:Union[int, List[int]], dim:int=0) -> Tuple[Tensor, ...]:
+    assert all_int(self.shape), f"does not support symbolic shape {self.shape}"
+    dim = dim + self.ndim if dim < 0 else dim
+    if isinstance(sizes, int): return tuple(self.chunk(math.ceil(self.shape[dim]/sizes)))
+    return tuple(self[sl] for sl in [tuple([slice(None)]*dim + [slice(sum(sizes[:i]), sum(sizes[:i + 1]))]) for i in range(len(sizes))])
+
   def chunk(self, num:int, dim:int=0) -> List[Tensor]:
     assert all_int(self.shape), f"does not support symbolic shape {self.shape}"
     dim, step = dim + self.ndim if dim < 0 else dim, math.ceil(self.shape[dim]/num)
@@ -450,7 +483,7 @@ class Tensor:
     return [self[tuple(sl)] for sl in slice_params]
 
   def squeeze(self, dim:Optional[int]=None) -> Tensor:
-    if dim is None: return self if 1 not in self.shape else self.reshape(*[dim for dim in self.shape if dim != 1])
+    if dim is None: return self.reshape(tuple(dim for dim in self.shape if dim != 1))
     if self.ndim == 0 and dim in [-1, 0]: return self  # this is to match torch behavior
     if not -self.ndim <= dim <= self.ndim-1: raise IndexError(f"{dim=} out of range {[-self.ndim, self.ndim-1] if self.ndim else [-1, 0]}")
     if dim < 0: dim += self.ndim
@@ -471,7 +504,12 @@ class Tensor:
     order = list(range(self.ndim))
     order[ax1], order[ax2] = order[ax2], order[ax1]
     return self.permute(order)
-  def flatten(self, start_dim=0): return self.reshape(shape=self.shape[:start_dim] + (-1,))
+  def flatten(self, start_dim=0, end_dim=-1):
+    start_dim, end_dim = start_dim + self.ndim if start_dim < 0 else start_dim, end_dim + self.ndim if end_dim < 0 else end_dim
+    return self.reshape(self.shape[:start_dim] + (prod(self.shape[start_dim:end_dim+1]), ) + self.shape[end_dim+1:])
+  def unflatten(self, dim:int, sizes:Tuple[int,...]):
+    if dim < 0: dim += self.ndim
+    return self.reshape(self.shape[:dim] + sizes + self.shape[dim+1:])
 
   # ***** reduce ops *****
 
@@ -484,7 +522,14 @@ class Tensor:
     ret = fxn.apply(self, new_shape=tuple([1 if i in axis_ else s for i,s in enumerate(self.shape)]))
     return ret if keepdim else ret.reshape(shape=shape)
 
-  def sum(self, axis=None, keepdim=False): return self._reduce(mlops.Sum, axis, keepdim)
+  def sum(self, axis=None, keepdim=False):
+    acc_dtype = least_upper_dtype(self.dtype, dtypes.uint) if dtypes.is_unsigned(self.dtype) else \
+                least_upper_dtype(self.dtype, dtypes.int) if (dtypes.is_int(self.dtype) or self.dtype==dtypes.bool) else \
+                least_upper_dtype(self.dtype, dtypes.float)
+    # cast back to float16 or bfloat16 to match torch / jax behavior, but we use float for acc
+    output_dtype = self.dtype if self.dtype in (dtypes.float16, dtypes.bfloat16) else acc_dtype
+    return self.cast(acc_dtype)._reduce(mlops.Sum, axis, keepdim).cast(output_dtype)
+
   def max(self, axis=None, keepdim=False): return self._reduce(mlops.Max, axis, keepdim)
   def min(self, axis=None, keepdim=False): return -((-self).max(axis=axis, keepdim=keepdim))
 
@@ -512,16 +557,17 @@ class Tensor:
   def argmax(self, axis=None, keepdim=False):
     if axis is None:
       idx = (self == self.max(axis)) * Tensor.arange(prod(self.shape)-1,-1,-1, requires_grad=False, device=self.device).reshape(self.shape)
-      return prod(self.shape) - idx.max() - 1
+      return (prod(self.shape) - idx.max() - 1).cast(dtypes.default_int)
     axis = axis + len(self.shape) if axis < 0 else axis
     m = self == self.max(axis=axis, keepdim=True)
     idx = m * Tensor.arange(self.shape[axis]-1,-1,-1, requires_grad=False, device=self.device).reshape(self.shape[axis], *[1]*(self.ndim-axis-1))
-    return self.shape[axis]-idx.max(axis=axis, keepdim=keepdim)-1
+    return (self.shape[axis]-idx.max(axis=axis, keepdim=keepdim)-1).cast(dtypes.default_int)
   def argmin(self, axis=None, keepdim=False): return (-self).argmax(axis=axis, keepdim=keepdim)
 
   @staticmethod
   def einsum(formula:str, *raw_xs) -> Tensor:
     xs:Tuple[Tensor] = argfix(*raw_xs)
+    formula = formula.replace(" ", "")
     inputs_str, output = formula.split("->") if "->" in formula else (formula, sorted(formula))
     inputs = [x for x in cast(str,inputs_str).split(',')]
     assert len(xs) == len(inputs), f"number of inputs doesn't match number of operands in formula, expected {len(inputs)}, got {len(xs)}"
@@ -573,7 +619,7 @@ class Tensor:
 
   def conv_transpose2d(self, weight:Tensor, bias:Optional[Tensor]=None, groups=1, stride=1, dilation=1, padding=0, output_padding=0) -> Tensor:
     HW, trailing = weight.shape[2:], list(range(3, len(weight.shape)+1))
-    x, w = self, weight.reshape(groups, weight.shape[0]//groups, weight.shape[1], *weight.shape[2:]).permute(0,2,1,*trailing).flip(trailing)
+    x, w = self, weight.unflatten(0, (groups, -1)).permute(0,2,1,*trailing).flip(trailing)
     stride = make_pair(stride, len(HW))
     if any(s>1 for s in stride):
       x = x.reshape(None, None, *flatten((k,1) for k in x.shape[2:]))
@@ -581,7 +627,7 @@ class Tensor:
       x = x.reshape(None, None, *[k*s for k,s in zip(x.shape[2::2], stride)])
       x = x.shrink((None, None, *[(0,k-(s-1)) for k,s in zip(x.shape[2:], stride)]))
     padding = flatten((((k-1)*d-p,(k-1)*d-p+op) for k,d,p,op in reversed(list(zip(HW, make_pair(dilation, len(HW)), make_pair(padding, len(HW)), make_pair(output_padding, len(HW)))))))  # noqa: E501
-    return x.conv2d(w.reshape(w.shape[0]*w.shape[1],*w.shape[2:]), groups=groups, bias=bias, dilation=dilation, padding=padding)
+    return x.conv2d(w.flatten(end_dim=1), groups=groups, bias=bias, dilation=dilation, padding=padding)
 
   wino = getenv("WINO", 0)
   def conv2d(self, weight:Tensor, bias:Optional[Tensor]=None, groups=1, stride=1, dilation=1, padding=0) -> Tensor:
@@ -640,7 +686,9 @@ class Tensor:
     assert self.shape[-1] == w.shape[-min(n2, 2)], f"Input Tensor shapes {self.shape} and {w.shape} cannot be multiplied ({self.shape[-1]} != {w.shape[-min(n2, 2)]})"  # noqa: E501
     x = self.reshape(*self.shape[0:-1], *[1]*min(n1-1, n2-1, 1), self.shape[-1])
     w = w.reshape(*w.shape[0:-2], *[1]*min(n1-1, n2-1, 1), *w.shape[-min(n2, 2):]).transpose(-1, -min(n2, 2))
-    return (x*w).sum(-1)
+    return (x*w).sum(-1).cast(least_upper_dtype(x.dtype, w.dtype))
+
+  def matmul(self, x:Tensor, reverse=False) -> Tensor: return x.dot(self) if reverse else self.dot(x)
 
   def _cumsum(self, axis:int=0, _first_zero=False) -> Tensor:
     return self.transpose(axis,-1).pad2d((self.shape[axis]-int(not _first_zero),0))._pool((self.shape[axis],)).sum(-1).transpose(axis,-1)
@@ -650,24 +698,23 @@ class Tensor:
     SPLIT = 256
     if self.shape[axis] <= SPLIT*2: return self._cumsum(axis)
     ret = self.transpose(axis,-1).pad2d((round_up(self.shape[axis], SPLIT)-self.shape[axis], 0))
-    ret = ret.reshape(*ret.shape[0:-1], ret.shape[-1]//SPLIT, SPLIT)._cumsum(-1)
+    ret = ret.unflatten(-1, (-1, SPLIT))._cumsum(-1)
     base_add = ret[..., -1]._cumsum(-1, _first_zero=True)[..., :-1]
     base_add = base_add.unsqueeze(-1).expand(*base_add.shape, ret.shape[-1])
-    def fix(x:Tensor): return x.reshape(*ret.shape[0:-2], ret.shape[-2] * ret.shape[-1])[..., -self.shape[axis]:].transpose(axis,-1)
+    def fix(x:Tensor): return x.flatten(start_dim=-2)[..., -self.shape[axis]:].transpose(axis,-1)
     return fix(ret) + fix(base_add)
 
   @staticmethod
   def _tri(r:sint, c:sint, k:int=0, **kwargs) -> Tensor:
     assert all_int((r,c)), "does not support symbolic"
     return Tensor.arange(r, **kwargs).unsqueeze(1).expand(r,c) <= Tensor.arange(-k, c-k, **kwargs).unsqueeze(0).expand(r,c)
-  def triu(self, k:int=0) -> Tensor:
-    return Tensor._tri(self.shape[-2], self.shape[-1], k=k, dtype=self.dtype, device=self.device).where(self, Tensor.zeros_like(self))
-  def tril(self, k:int=0) -> Tensor:
-    return Tensor._tri(self.shape[-2], self.shape[-1], k=k+1, dtype=self.dtype, device=self.device).where(Tensor.zeros_like(self), self)
+  def triu(self, k:int=0) -> Tensor: return Tensor._tri(self.shape[-2], self.shape[-1], k=k, device=self.device).where(self, 0)
+  def tril(self, k:int=0) -> Tensor: return Tensor._tri(self.shape[-2], self.shape[-1], k=k+1, device=self.device).where(0, self)
 
   # ***** mlops (unary) *****
 
   def neg(self): return mlops.Neg.apply(self)
+  def logical_not(self): return self.neg() if self.dtype == dtypes.bool else (1.0-self)
   def contiguous(self): return mlops.Contiguous.apply(self)
   def contiguous_backward(self): return mlops.ContiguousBackward.apply(self)
   def log(self): return mlops.Log.apply(self.cast(least_upper_float(self.dtype)))
@@ -684,7 +731,7 @@ class Tensor:
 
   # ***** math functions (unary) *****
 
-  def trunc(self: Tensor) -> Tensor: return self.cast(dtypes.int32).contiguous().cast(self.dtype)
+  def trunc(self: Tensor) -> Tensor: return self.cast(dtypes.int32).cast(self.dtype)
   def ceil(self: Tensor) -> Tensor: return (self > (b := self.trunc())).where(b+1, b)
   def floor(self: Tensor) -> Tensor: return (self < (b := self.trunc())).where(b-1, b)
 
@@ -716,9 +763,9 @@ class Tensor:
   def softplus(self, beta=1): return (1/beta) * (1 + (self*beta).exp()).log()
   def softsign(self): return self / (1 + self.abs())
 
-  # ***** broadcasted binary mlops *****
+  # ***** broadcasted elementwise mlops *****
 
-  def _broadcasted(self, y:Union[Tensor, float, int, bool], reverse:bool=False, match_dtype:bool=True) -> Tuple[Tensor, Tensor]:
+  def _broadcasted(self, y:Union[Tensor, Scalar], reverse:bool=False, match_dtype:bool=True) -> Tuple[Tensor, Tensor]:
     x: Tensor = self
     if not isinstance(y, Tensor):
       # make y a Tensor
@@ -740,25 +787,26 @@ class Tensor:
     broadcasted_shape = tuple(max(xi, yi) for xi, yi in zip(x.shape, y.shape))
     return x.expand(broadcasted_shape), y.expand(broadcasted_shape)
 
-  def _to_const_val(self, x:Union[Tensor, float, int, bool]) -> Union[Tensor, float, int, bool]:
-    return x.lazydata.base.arg if isinstance(x, Tensor) and x.lazydata.is_unrealized_contiguous_const() \
+  def _to_const_val(self, x:Union[Tensor, Scalar]) -> Union[Tensor, Scalar]:
+    # TODO: update with multi
+    return x.lazydata.base.arg if isinstance(x, Tensor) and isinstance(x.lazydata, LazyBuffer) and x.lazydata.is_unrealized_contiguous_const() \
       and not x.requires_grad and self._broadcasted(x)[0].shape == self.shape else x
 
-  def add(self, x:Union[Tensor, float, int, bool], reverse=False) -> Tensor:
+  def add(self, x:Union[Tensor, Scalar], reverse=False) -> Tensor:
     x = self._to_const_val(x)
     return mlops.Add.apply(*self._broadcasted(x, reverse)) if x.__class__ is Tensor or x else self
-  def sub(self, x:Union[Tensor, float, int, bool], reverse=False) -> Tensor:
+  def sub(self, x:Union[Tensor, Scalar], reverse=False) -> Tensor:
     x = self._to_const_val(x)
     return mlops.Sub.apply(*self._broadcasted(x, reverse)) if x.__class__ is Tensor or x else (-self if reverse else self)
-  def mul(self, x:Union[Tensor, float, int, bool], reverse=False) -> Tensor:
+  def mul(self, x:Union[Tensor, Scalar], reverse=False) -> Tensor:
     x = self._to_const_val(x)
     if x.__class__ is not Tensor and x == 0.0: return mlops.Zero.apply(self)
     if x.__class__ is not Tensor and x == -1.0: return -self
     return mlops.Mul.apply(*self._broadcasted(x, reverse)) if x.__class__ is Tensor or x != 1.0 else self
-  def div(self, x:Union[Tensor, float, int, bool], reverse=False) -> Tensor:
+  def div(self, x:Union[Tensor, Scalar], reverse=False) -> Tensor:
     x = self._to_const_val(x)
     return mlops.Div.apply(*self._broadcasted(x, reverse)) if x.__class__ is Tensor or reverse or not x or not dtypes.is_float(self.dtype) else self.mul(1/x)  # noqa: E501
-  def pow(self, x:Union[Tensor, float, int, bool], reverse=False) -> Tensor:
+  def pow(self, x:Union[Tensor, Scalar], reverse=False) -> Tensor:
     x = self._to_const_val(x)
     if not isinstance(x, Tensor) and not reverse:
       # simple pow identities
@@ -777,13 +825,13 @@ class Tensor:
     to_nan = (((x - x.trunc()) * 1e10).abs().clip(0, 1) if isinstance(x, Tensor) else int(bool(x - int(x))) if not reverse else ((self - self.trunc()) * 1e10).abs().clip(0, 1)) * base_sign  # noqa: E501
     inject_nan = ((((-to_nan) * 2) + 1)).log().add(1) if isinstance(to_nan, Tensor) else 1 if not to_nan else float("nan")
     return ar.mul(sign * base_sign + (1 - base_sign)).mul(inject_nan)
-  def matmul(self, x:Tensor, reverse=False) -> Tensor: return x.dot(self) if reverse else self.dot(x)
   def xor(self, x:Tensor, reverse=False) -> Tensor: return mlops.Xor.apply(*self._broadcasted(x, reverse))
 
-  def maximum(self, x:Union[Tensor, float]) -> Tensor: return (self<x).detach().where(x, (self>x).detach().where(self, (self+x)/2))
-  def minimum(self, x:Union[Tensor, float]) -> Tensor: return -((-self).maximum(-x))
+  # TODO: this implicitly changes dtype with /2
+  def maximum(self, x:Union[Tensor, Scalar]) -> Tensor: return (self<x).detach().where(x, (self>x).detach().where(self, (self+x)/2))
+  def minimum(self, x:Union[Tensor, Scalar]) -> Tensor: return -((-self).maximum(-x))
 
-  def where(self:Tensor, input_:Union[Tensor, float], other:Union[Tensor, float]):
+  def where(self:Tensor, input_:Union[Tensor, Scalar], other:Union[Tensor, Scalar]):
     x_,y = self._broadcasted(input_, match_dtype=False)
     x,z = x_._broadcasted(other, match_dtype=False)
     return mlops.Where.apply(x.cast(dtypes.bool), *y._broadcasted(z))
@@ -816,13 +864,12 @@ class Tensor:
   def __imatmul__(self, x) -> Tensor: return self.assign(self.matmul(x))
   def __ixor__(self, x) -> Tensor: return self.assign(self.xor(x))
 
-  # in webgpu bool cannot be used as a storage buffer type
-  def __lt__(self, x) -> Tensor: return mlops.Less.apply(*self._broadcasted(x, False)).cast(dtypes.float if self.device == "WEBGPU" else dtypes.bool)
-  def __gt__(self, x) -> Tensor: return mlops.Less.apply(*self._broadcasted(x, True)).cast(dtypes.float if self.device == "WEBGPU" else dtypes.bool)
-  def __ge__(self, x) -> Tensor: return 1.0-(self<x)
-  def __le__(self, x) -> Tensor: return 1.0-(self>x)
-  def __ne__(self, x) -> Tensor: return (self<x) + (self>x)   # type: ignore[override]
-  def __eq__(self, x) -> Tensor: return 1.0-(self != x)       # type: ignore[override]
+  def __lt__(self, x) -> Tensor: return mlops.Less.apply(*self._broadcasted(x, False))
+  def __gt__(self, x) -> Tensor: return mlops.Less.apply(*self._broadcasted(x, True))
+  def __ge__(self, x) -> Tensor: return (self<x).logical_not()
+  def __le__(self, x) -> Tensor: return (self>x).logical_not()
+  def __eq__(self, x) -> Tensor: return mlops.Eq.apply(*self._broadcasted(x, True))   # type: ignore[override]
+  def __ne__(self, x) -> Tensor: return (self==x).logical_not()                       # type: ignore[override]
 
   # ***** functional nn ops *****
 
@@ -844,8 +891,7 @@ class Tensor:
 
   def dropout(self, p=0.5) -> Tensor:
     if not Tensor.training or p == 0: return self
-    mask = (Tensor.rand(*self.shape, requires_grad=False, device=self.device) >= p).cast(dtypes.bool)
-    return self * mask * (1/(1.0 - p))
+    return self * (Tensor.rand(*self.shape, requires_grad=False, device=self.device) >= p) * (1/(1.0 - p))
 
   def scaled_dot_product_attention(self, key:Tensor, value:Tensor, attn_mask:Optional[Tensor]=None, dropout_p:float=0.0, is_causal:bool=False) -> Tensor:  # noqa: E501
     # NOTE: it works if key, value have symbolic shape
@@ -859,22 +905,22 @@ class Tensor:
     return (-y*self.log() - (1-y)*(1-self).log()).mean()
 
   def binary_crossentropy_logits(self, y:Tensor) -> Tensor:
-    return (self.maximum(0) - y * self + (1 + self.abs().__neg__().exp()).log()).mean()
+    return (self.maximum(0) - y * self + (1 + self.abs().neg().exp()).log()).mean()
 
   def sparse_categorical_crossentropy(self, Y:Tensor, ignore_index=-1) -> Tensor:
     # NOTE: self is a logits input
-    loss_mask = (Y != ignore_index).cast(dtypes.float)
-    y_counter = Tensor.arange(self.shape[-1], requires_grad=False, device=self.device).unsqueeze(0).expand(Y.numel(), self.shape[-1])  # noqa: E501
+    loss_mask = (Y != ignore_index)
+    y_counter = Tensor.arange(self.shape[-1], requires_grad=False, device=self.device).unsqueeze(0).expand(Y.numel(), self.shape[-1])
     y = ((y_counter == Y.flatten().reshape(-1, 1)).where(-1, 0) * loss_mask.reshape(-1, 1)).reshape(*Y.shape, self.shape[-1])
     return self.log_softmax().mul(y).sum() / loss_mask.sum()
 
   # ***** cast ops *****
 
   def cast(self, dtype:DType) -> Tensor:
+    if self.dtype == dtype: return self
     # hack for devices that don't support bfloat16
-    if self.dtype == dtypes.bfloat16:
-      return self.bitcast(dtypes.uint16).cast(dtypes.uint32).mul(1<<16).contiguous().bitcast(dtypes.float32).cast(dtype)
-    return mlops.Cast.apply(self, dtype=dtype) if self.dtype != dtype else self
+    if self.dtype == dtypes.bfloat16: return self.bitcast(dtypes.uint16).cast(dtypes.uint32).mul(1<<16).bitcast(dtypes.float32).cast(dtype)
+    return mlops.Cast.apply(self, dtype=dtype)
   def bitcast(self, dtype:DType) -> Tensor:
     assert self.dtype.itemsize == dtype.itemsize, "can't bitcast mismatched dtype itemsizes"
     return mlops.Cast.apply(self, dtype=dtype, bitcast=True) if self.dtype != dtype else self
@@ -891,7 +937,7 @@ class Tensor:
   def is_floating_point(self) -> bool: return dtypes.is_float(self.dtype)
 
 # register functions to move between devices
-for device in Device._buffers: setattr(Tensor, f"{device.lower()}", partialmethod(Tensor.to, device))
+for device in Device._devices: setattr(Tensor, f"{device.lower()}", partialmethod(Tensor.to, device))
 
 if IMAGE:
   # if IMAGE>0 we install these replacement functions in Tensor (hack!)
