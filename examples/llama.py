@@ -16,7 +16,7 @@ from sentencepiece import SentencePieceProcessor, sentencepiece_model_pb2
 import gguf
 from gguf.constants import GGML_QUANT_SIZES, GGMLQuantizationType
 
-MAX_CONTEXT = getenv("MAX_CONTEXT", 4096)
+MAX_CONTEXT = getenv("MAX_CONTEXT", 512)
 
 # calculating params:
 # traditionally, the MLP in the transformer architecture has hidden_dim = dim*4 [arxiv/1706.03762, 3.3]
@@ -105,7 +105,6 @@ MODEL_PARAMS = {
   }
 }
 
-
 # **** helper functions ****
 def concat_weights(models):
   def convert(name) -> Tensor:
@@ -178,6 +177,7 @@ def load_gguf_weights(reader: gguf.GGUFReader, model):
         w = dequantize_q4_0(tensor)
     elif tensor.tensor_type == GGMLQuantizationType.Q6_K:
       w = dequantize_q6_k(tensor)
+    #   w, scale = QK4_0Linear.quantize_tensor(dequantize_q6_k(tensor))
     elif tensor.tensor_type == GGMLQuantizationType.F32:
       w = Tensor(tensor.data).reshape(np.flip(tensor.shape).tolist()).half()
     else: raise RuntimeError("Quantization type still not supported!")
@@ -275,11 +275,25 @@ class QK4_0Linear:
         new_tensors[name] = v
     return new_tensors
 
+  @staticmethod
+  def quantize_tensor(t):
+    # https://github.com/ggerganov/llama.cpp/blob/master/ggml-quants.c#L427
+    blocks = t.reshape(-1, 32)
+    weight = Tensor.zeros(blocks.shape[0], 16, dtype=dtypes.uint8)
+    _min, _max = blocks.min(axis=1), blocks.max(axis=1)
+    scale = (_min.abs() > _max).where(_min, _max) / -8
+    scale_inverse = scale.where(scale.reciprocal(), Tensor.zeros_like(scale))
+    quants = (((blocks * scale_inverse.unsqueeze(1)) + 8.5).clip(0, 15)).cast(dtypes.uint8)
+    weight = weight.xor(quants[:, :16])
+    weight = weight.xor(quants[:, 16:] * 16)
+    scale = scale.unsqueeze(1).half()
+    return weight, scale
+
   def dequantize(self):
     # https://github.com/ggerganov/llama.cpp/blob/master/ggml-quants.c#L1074
-    div = (self.weight / 16)
+    div = (self.weight / 16).realize()
     return (
-        (Tensor.cat(self.weight - (div * 16), div, dim=1).cast(dtypes.int8) - 8).half() * self.scale
+        (Tensor.cat(self.weight - (div * 16), div, dim=1).cast(dtypes.int8) - 8) * self.scale
       ).reshape((self.out_features, self.in_features))
 
   def __call__(self, x):
@@ -298,6 +312,7 @@ class LLaMa:
       model = Transformer(**params["args"], linear=AbsmaxQuantizedLinear, output_layer=AbsmaxQuantizedLinear, max_context=MAX_CONTEXT, jit=jit)
     elif use_4bit:
       model = Transformer(**params["args"], linear=QK4_0Linear, max_context=MAX_CONTEXT, jit=jit)
+    #   model = Transformer(**params["args"], linear=QK4_0Linear, output_layer=QK4_0Linear, max_context=MAX_CONTEXT, jit=jit)
     else:
       model = Transformer(**params["args"], max_context=MAX_CONTEXT, jit=jit)
 
@@ -314,6 +329,7 @@ class LLaMa:
     weights = {k:v.to(Device.DEFAULT).cast(dtypes.float16) if v.dtype == dtypes.bfloat16 else v for k,v in weights.items()}
 
     if quantize:
+      linear_layer = AbsmaxQuantizedLinear if not use_4bit and quantize else QK4_0Linear
       weights = linear_layer.quantize(weights)
       for _,v in weights.items(): v.realize()
     load_state_dict(model, weights, strict=False)
@@ -516,8 +532,9 @@ After you are done speaking, output [EOS]. You are not Chad.
   LLAMA_SUFFIX = {"1": "", "2": "-2", "code": "-code", "tiny": "-tiny"}[args.gen]
   MODEL_PATH = args.model or Path(__file__).parents[1] / f"weights/LLaMA{LLAMA_SUFFIX}/{args.size}"
   TOKENIZER_PATH = '' if str(args.model).endswith('.gguf') else (MODEL_PATH if MODEL_PATH.is_dir() else MODEL_PATH.parent) / "tokenizer.model"
+  use_4bit = args.use_4bit or str(args.model).endswith('.gguf')
   print(f"using LLaMA{LLAMA_SUFFIX}-{args.size} model")
-  llama = LLaMa.build(MODEL_PATH, TOKENIZER_PATH, model_gen=args.gen, model_size=args.size, quantize=args.quantize)
+  llama = LLaMa.build(MODEL_PATH, TOKENIZER_PATH, model_gen=args.gen, model_size=args.size, quantize=args.quantize, use_4bit=use_4bit)
   param_count = sum(x.lazydata.size for x in get_parameters(llama.model))
 
   if chatbot:

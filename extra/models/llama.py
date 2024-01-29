@@ -38,7 +38,7 @@ class RMSNorm:
 
   def __call__(self, x:Tensor):
     x = x.float()
-    return (x * (x.pow(2).mean(-1, keepdim=True) + self.eps).rsqrt()) * self.weight
+    return ((x * (x.pow(2).mean(-1, keepdim=True) + self.eps).rsqrt()) * self.weight)
 
 class Attention:
   def __init__(self, dim, n_heads, n_kv_heads, max_context, linear=nn.Linear):
