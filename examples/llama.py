@@ -7,7 +7,7 @@ from pathlib import Path
 import sys, argparse, json
 import numpy as np
 np.set_printoptions(linewidth=200)
-from tinygrad.helpers import Timing, Profiling, getenv, DEBUG, colored
+from tinygrad.helpers import Timing, Profiling, getenv, DEBUG, colored, Context
 from tinygrad import Device, GlobalCounters, dtypes
 from tinygrad.tensor import Tensor
 from tinygrad.nn.state import safe_load, torch_load, load_state_dict, get_parameters
@@ -122,8 +122,8 @@ def dequantize_q4_0(tensor: gguf.ReaderTensor):
   blks = tensor.data.reshape(-1,type_sz)
   scales  = Tensor(blks[:,:2].flatten().view(np.float16)).repeat((block_sz,1)).transpose().cast(dtypes.float16)
   weights = Tensor(blks)[:,2:]
-  div = (weights / 16)
-  return ((Tensor.cat(weights - (div * 16), div, dim=1).cast(dtypes.int8) - 8) * scales).reshape(np.flip(tensor.shape).tolist())
+  div = (weights * 16**-1).cast(dtypes.uint32)
+  return ((Tensor.cat(((weights - (div * 16)).cast(dtypes.int32)-8), div.cast(dtypes.int32)-8, dim=1) ) * scales).reshape(np.flip(tensor.shape).tolist())
 
 def get_weight_and_scale_from_q4_0(tensor):
   blocks = tensor.reshape(-1, 18)
@@ -291,12 +291,15 @@ class QK4_0Linear:
 
   def dequantize(self):
     # https://github.com/ggerganov/llama.cpp/blob/master/ggml-quants.c#L1074
-    div = (self.weight / 16).realize()
+    div = (self.weight * 16**-1).cast(dtypes.uint32)
     return (
-        (Tensor.cat(self.weight - (div * 16), div, dim=1).cast(dtypes.int8) - 8) * self.scale
+        (Tensor.cat(((self.weight - (div * 16)).cast(dtypes.int32)-8)* self.scale, (div.cast(dtypes.int32)-8)* self.scale, dim=1))
       ).reshape((self.out_features, self.in_features))
 
   def __call__(self, x):
+    # with Context(DEBUG=2):
+    #   self.dequantize().realize()
+    # exit()
     return x.dot(self.dequantize().T)
 
 class LLaMa:
