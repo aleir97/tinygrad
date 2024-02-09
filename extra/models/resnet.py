@@ -26,7 +26,7 @@ class BasicBlock:
     out = out.relu()
     return out
 
-
+i = 0
 class Bottleneck:
   # NOTE: stride_in_1x1=False, this is the v1.5 variant
   expansion = 4
@@ -48,11 +48,22 @@ class Bottleneck:
       ]
 
   def __call__(self, x):
+    global i
+    i = i+1
+    # print(f"Block { i }")
+    # print(f"x.shape { x.shape }")
     out = self.bn1(self.conv1(x)).relu()
+    # print(f"self.conv1.weight.shape { self.conv1.weight.shape }")
     out = self.bn2(self.conv2(out)).relu()
+    # print(f"self.conv2.weight.shape { self.conv2.weight.shape }")
     out = self.bn3(self.conv3(out))
+    # print(f"self.conv3.weight.shape { self.conv3.weight.shape }")
+    # if self.downsample:
+    #   print(f"self.downsample.shape { self.downsample[0].weight.shape }")
+
     out = out + x.sequential(self.downsample)
     out = out.relu()
+    # print(f"out.shape { out.shape }")
     return out
 
 class ResNet:
@@ -100,8 +111,14 @@ class ResNet:
   def forward(self, x):
     is_feature_only = self.fc is None
     if is_feature_only: features = []
+    out = (self.conv1(x))
+    print(out.shape)
+    # out = out.pad2d([1,1,1,1]).max_pool2d((3,3), 2)
+    return out
     out = self.bn1(self.conv1(x)).relu()
-    out = out.pad2d([1,1,1,1]).max_pool2d((3,3), 2)
+
+
+
     out = out.sequential(self.layer1)
     if is_feature_only: features.append(out)
     out = out.sequential(self.layer2)

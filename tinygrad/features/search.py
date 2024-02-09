@@ -66,11 +66,12 @@ def try_compile_linearized_w_idx(x):
     if DEBUG >= 4: traceback.print_exc()
     return (x[0], None)
 
-def compile_linearizer(dev:str, lin:Linearizer, name:Optional[str]=None) -> Tuple[bytes, Optional[List[int]], Optional[List[int]]]:
+def compile_linearizer(dev:str, lin:Linearizer, name:Optional[str]=None, print_code=False) -> Tuple[bytes, Optional[List[int]], Optional[List[int]]]:
   lin.linearize()
   rdev = Device[dev]
   assert isinstance(rdev, Compiled)
   src, _ = rdev.renderer(name if name is not None else to_function_name(lin.name), lin.uops)   # NOTE: these all have the same name for deduping
+  if print_code: print(src)
   return rdev.compiler(src), lin.global_size, lin.local_size
 
 def time_program(dev:str, lib:bytes, global_size, local_size, var_vals, rawbufs, early_stop=None, max_global_size=65536, clear_l2=False, cnt=3, name="test"):  # noqa: E501
